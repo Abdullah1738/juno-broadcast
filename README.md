@@ -2,5 +2,6 @@
 
 Submit signed raw transactions to `junocashd` and track status.
 
-Status: work in progress.
+Used for withdrawals and sweeps/rebalances; no key material required.
 
+Status: work in progress.
