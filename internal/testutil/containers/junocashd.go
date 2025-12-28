@@ -53,7 +53,6 @@ func StartJunocashd(ctx context.Context) (*Junocashd, error) {
 		Cmd: []string{
 			"-regtest",
 			"-server=1",
-			"-txindex=1",
 			"-daemon=0",
 			"-listen=0",
 			"-printtoconsole=1",

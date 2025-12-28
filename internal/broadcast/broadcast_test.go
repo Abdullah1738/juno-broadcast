@@ -81,7 +81,7 @@ func TestStatus_FallbacksToMempool(t *testing.T) {
 	txid := strings.Repeat("b", 64)
 
 	var gotGetRawTx bool
-	var gotMempool bool
+	var gotMempoolEntry bool
 
 	c, err := New(fakeRPC{
 		call: func(ctx context.Context, method string, params any, out any) error {
@@ -89,10 +89,8 @@ func TestStatus_FallbacksToMempool(t *testing.T) {
 			case "getrawtransaction":
 				gotGetRawTx = true
 				return &junocashd.RPCError{Code: -5, Message: "No such mempool or blockchain transaction"}
-			case "getrawmempool":
-				gotMempool = true
-				dst := out.(*[]string)
-				*dst = []string{strings.ToUpper(txid)}
+			case "getmempoolentry":
+				gotMempoolEntry = true
 				return nil
 			default:
 				return errors.New("unexpected method: " + method)
@@ -110,8 +108,8 @@ func TestStatus_FallbacksToMempool(t *testing.T) {
 	if !found || !st.InMempool || st.Confirmations != 0 {
 		t.Fatalf("unexpected status: %+v found=%v", st, found)
 	}
-	if !gotGetRawTx || !gotMempool {
-		t.Fatalf("expected getrawtransaction and getrawmempool calls")
+	if !gotGetRawTx || !gotMempoolEntry {
+		t.Fatalf("expected getrawtransaction and getmempoolentry calls")
 	}
 }
 
@@ -124,6 +122,8 @@ func TestWaitForConfirmations_ZeroReturnsOnMempool(t *testing.T) {
 			switch method {
 			case "getrawtransaction":
 				return &junocashd.RPCError{Code: -5, Message: "No such mempool or blockchain transaction"}
+			case "getmempoolentry":
+				return &junocashd.RPCError{Code: -32601, Message: "Method not found"}
 			case "getrawmempool":
 				calls++
 				dst := out.(*[]string)
@@ -150,5 +150,75 @@ func TestWaitForConfirmations_ZeroReturnsOnMempool(t *testing.T) {
 	}
 	if calls == 0 {
 		t.Fatalf("expected mempool check")
+	}
+}
+
+func TestStatus_FallbacksToChainScanWithoutTxIndex(t *testing.T) {
+	txid := strings.Repeat("d", 64)
+
+	c, err := New(fakeRPC{
+		call: func(ctx context.Context, method string, params any, out any) error {
+			switch method {
+			case "getrawtransaction":
+				return &junocashd.RPCError{Code: -5, Message: "No such mempool or blockchain transaction"}
+			case "getmempoolentry":
+				return &junocashd.RPCError{Code: -5, Message: "No such mempool transaction"}
+			case "getbestblockhash":
+				dst := out.(*string)
+				*dst = "h2"
+				return nil
+			case "getblock":
+				ps := params.([]any)
+				hash := ps[0].(string)
+				dst := out.(*struct {
+					Hash              string   `json:"hash"`
+					Confirmations     int64    `json:"confirmations"`
+					PreviousBlockHash string   `json:"previousblockhash"`
+					Tx                []string `json:"tx"`
+				})
+				switch hash {
+				case "h2":
+					*dst = struct {
+						Hash              string   `json:"hash"`
+						Confirmations     int64    `json:"confirmations"`
+						PreviousBlockHash string   `json:"previousblockhash"`
+						Tx                []string `json:"tx"`
+					}{
+						Hash:              "h2",
+						Confirmations:     1,
+						PreviousBlockHash: "h1",
+						Tx:                []string{"x"},
+					}
+				case "h1":
+					*dst = struct {
+						Hash              string   `json:"hash"`
+						Confirmations     int64    `json:"confirmations"`
+						PreviousBlockHash string   `json:"previousblockhash"`
+						Tx                []string `json:"tx"`
+					}{
+						Hash:              "h1",
+						Confirmations:     2,
+						PreviousBlockHash: "h0",
+						Tx:                []string{strings.ToUpper(txid)},
+					}
+				default:
+					return errors.New("unexpected block hash: " + hash)
+				}
+				return nil
+			default:
+				return errors.New("unexpected method: " + method)
+			}
+		},
+	}, WithChainLookback(10))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	st, found, err := c.Status(context.Background(), txid)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !found || st.InMempool || st.Confirmations != 2 || st.BlockHash != "h1" {
+		t.Fatalf("unexpected status: %+v found=%v", st, found)
 	}
 }
