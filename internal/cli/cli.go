@@ -7,12 +7,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Abdullah1738/juno-broadcast/internal/broadcast"
+	"github.com/Abdullah1738/juno-broadcast/internal/httpapi"
 	"github.com/Abdullah1738/juno-sdk-go/junocashd"
 )
 
@@ -42,6 +46,8 @@ func RunWithIO(args []string, factory Factory, stdout, stderr io.Writer) int {
 		return runSubmit(args[1:], factory, stdout, stderr)
 	case "status":
 		return runStatus(args[1:], factory, stdout, stderr)
+	case "serve":
+		return runServe(args[1:], factory, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n\n", args[0])
 		writeUsage(stderr)
@@ -57,6 +63,7 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  juno-broadcast submit --rpc-url <url> --rpc-user <user> --rpc-pass <pass> --raw-tx-hex <hex> [--confirmations <n>] [--poll <duration>] [--json]")
 	fmt.Fprintln(w, "  juno-broadcast status --rpc-url <url> --rpc-user <user> --rpc-pass <pass> --txid <txid> [--json]")
+	fmt.Fprintln(w, "  juno-broadcast serve --rpc-url <url> --rpc-user <user> --rpc-pass <pass> --listen <addr> [--poll <duration>]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Env:")
 	fmt.Fprintln(w, "  JUNO_RPC_URL, JUNO_RPC_USER, JUNO_RPC_PASS")
@@ -193,6 +200,86 @@ func runStatus(args []string, factory Factory, stdout, stderr io.Writer) int {
 	}
 
 	return writeOK(stdout, jsonOut, st)
+}
+
+func runServe(args []string, factory Factory, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	var rpcURL string
+	var rpcUser string
+	var rpcPass string
+	var listen string
+	var pollStr string
+	var maxBodyBytes int64
+
+	fs.StringVar(&rpcURL, "rpc-url", "", "junocashd RPC URL")
+	fs.StringVar(&rpcUser, "rpc-user", "", "junocashd RPC username")
+	fs.StringVar(&rpcPass, "rpc-pass", "", "junocashd RPC password")
+	fs.StringVar(&listen, "listen", "127.0.0.1:8080", "listen address (host:port)")
+	fs.StringVar(&pollStr, "poll", "500ms", "poll interval (e.g. 500ms, 2s)")
+	fs.Int64Var(&maxBodyBytes, "max-body-bytes", 20<<20, "max request body bytes")
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return 2
+	}
+
+	rpcURL, rpcUser, rpcPass, err := rpcConfigFromFlags(rpcURL, rpcUser, rpcPass)
+	if err != nil {
+		return writeErr(stdout, stderr, false, "invalid_request", err.Error())
+	}
+
+	listen = strings.TrimSpace(listen)
+	if listen == "" {
+		return writeErr(stdout, stderr, false, "invalid_request", "listen is required")
+	}
+
+	poll, err := time.ParseDuration(pollStr)
+	if err != nil {
+		return writeErr(stdout, stderr, false, "invalid_request", "poll must be a duration")
+	}
+
+	r, err := factory(rpcURL, rpcUser, rpcPass, poll)
+	if err != nil {
+		return writeErr(stdout, stderr, false, "internal", err.Error())
+	}
+
+	api, err := httpapi.New(r, httpapi.WithMaxBodyBytes(maxBodyBytes))
+	if err != nil {
+		return writeErr(stdout, stderr, false, "internal", err.Error())
+	}
+
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return 0
+		}
+		fmt.Fprintln(stderr, err.Error())
+		return 1
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		return 0
+	}
 }
 
 func defaultFactory(rpcURL, rpcUser, rpcPass string, pollInterval time.Duration) (Runner, error) {
